@@ -21,14 +21,17 @@
 | Role | Hostname | IP |
 |---|---|---|
 | Control Plane | hv-rocky-linux-1 | 192.168.1.98 |
-| Worker | hv-rocky-linux-2 | 192.168.1.99 |
-| Worker | hv-rocky-linux-3 | 192.168.1.100 |
 
 - **Kubernetes version:** v1.31.14
 - **Container runtime:** containerd 2.2.6
 - **CNI:** Flannel (pod CIDR: 10.244.0.0/16)
 - **OS:** Rocky Linux 9.8 (Blue Onyx)
 - **SSH user:** mcropsey
+- **Ingress:** NGINX ingress controller running in hostNetwork mode on ports 80/443 directly on the node
+
+> **Single-node cluster:** This environment runs as a single-node cluster with the control plane taint removed so workloads can schedule on it. Worker nodes can be added later by joining them to the cluster.
+
+> **No MetalLB:** This setup does not use MetalLB. NGINX ingress runs in hostNetwork mode, binding directly to ports 80 and 443 on the node's IP. This is simpler and more reliable for a single-node lab than a floating VIP.
 
 ---
 
@@ -44,8 +47,6 @@ sudo sed -i '/swap/d' /etc/fstab
 ```bash
 sudo tee -a /etc/hosts <<'EOF'
 192.168.1.98  hv-rocky-linux-1
-192.168.1.99  hv-rocky-linux-2
-192.168.1.100 hv-rocky-linux-3
 EOF
 ```
 
@@ -109,19 +110,32 @@ sudo systemctl enable kubelet
 
 ---
 
-## Step 4 — Configure Firewall (All Nodes)
+## Step 4 — Configure Firewall (Control Plane Node)
 
 > Reference: https://kubernetes.io/docs/reference/networking/ports-and-protocols/
 
 ```bash
+# Kubernetes ports
 sudo firewall-cmd --permanent --add-port=6443/tcp
 sudo firewall-cmd --permanent --add-port=2379-2380/tcp
 sudo firewall-cmd --permanent --add-port=10250/tcp
 sudo firewall-cmd --permanent --add-port=10251/tcp
 sudo firewall-cmd --permanent --add-port=10252/tcp
-sudo firewall-cmd --permanent --add-port=30000-32767/tcp
 sudo firewall-cmd --permanent --add-port=8472/udp
 sudo firewall-cmd --permanent --add-masquerade
+
+# NGINX ingress hostNetwork ports (replaces NodePort/MetalLB)
+sudo firewall-cmd --permanent --add-port=80/tcp
+sudo firewall-cmd --permanent --add-port=443/tcp
+
+# Pod and service CIDR traffic (required for internal cluster routing)
+sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=10.244.0.0/16 accept'
+sudo firewall-cmd --permanent --add-rich-rule='rule family=ipv4 source address=10.96.0.0/12 accept'
+
+# Trust Flannel interfaces
+sudo firewall-cmd --permanent --zone=trusted --add-interface=flannel.1
+sudo firewall-cmd --permanent --zone=trusted --add-interface=cni0
+
 sudo firewall-cmd --reload
 ```
 
@@ -156,21 +170,38 @@ kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/
 
 ---
 
-## Step 7 — Join Worker Nodes (192.168.1.99 and 192.168.1.100)
+## Step 7 — Remove Control Plane Taint (Single-node only)
+
+By default kubeadm prevents workloads from running on the control plane node. For a single-node cluster remove this taint so pods can schedule:
+
+```bash
+kubectl taint nodes hv-rocky-linux-1 node-role.kubernetes.io/control-plane:NoSchedule-
+```
+
+> **Note:** The `-` at the end removes the taint. Skip this step if you are adding worker nodes — in a multi-node cluster the taint should remain in place.
+
+---
+
+## Step 8 — Add Worker Nodes (Optional — multi-node only)
 
 > Reference: https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-join/
 
+If adding worker nodes, run the join command on each worker. Generate a fresh join command from the control plane:
+
+```bash
+kubeadm token create --print-join-command
+```
+
+Then run the output on each worker node:
+
 ```bash
 sudo kubeadm join 192.168.1.98:6443 \
-  --token jveovj.47yyr8e45saiytdo \
-  --discovery-token-ca-cert-hash sha256:351588d0caec8e5b0ac6567c004c6f51d9685314b0186b0ef08697364201c69d \
+  --token <token> \
+  --discovery-token-ca-cert-hash <hash> \
   --cri-socket=unix:///run/containerd/containerd.sock
 ```
 
-> **Note:** Tokens expire after 24 hours. To generate a new join command:
-> ```bash
-> kubeadm token create --print-join-command
-> ```
+> **Note:** Tokens expire after 24 hours.
 
 ---
 
@@ -181,12 +212,10 @@ kubectl get nodes -o wide
 kubectl get pods -A
 ```
 
-Expected output:
+Expected output for single-node:
 ```
 NAME               STATUS   ROLES           AGE   VERSION
 hv-rocky-linux-1   Ready    control-plane   ...   v1.31.14
-hv-rocky-linux-2   Ready    <none>          ...   v1.31.14
-hv-rocky-linux-3   Ready    <none>          ...   v1.31.14
 ```
 
 ---
@@ -231,3 +260,4 @@ sudo systemctl status containerd
 - Swap was disabled permanently (removed from `/etc/fstab`)
 - `conntrack-tools` was required on Rocky Linux 9 — not installed by default and blocks `kubeadm init`
 - The join token expires after **24 hours** — regenerate with `kubeadm token create --print-join-command` on the control plane if rejoining a node later
+- MetalLB is not used in this setup — NGINX ingress runs in hostNetwork mode binding directly to ports 80/443

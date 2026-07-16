@@ -7,11 +7,10 @@ Engine URL: `https://engine.cropseyit.com/engine`
 | Node | IP | Role |
 |---|---|---|
 | hv-rocky-linux-1 | 192.168.1.98 | control-plane (run all kubectl/helm commands here) |
-| hv-rocky-linux-2 | 192.168.1.99 | worker |
-| hv-rocky-linux-3 | 192.168.1.100 | worker |
-| MetalLB VIP | 192.168.1.110 | ingress entrypoint |
 
-> **Note:** Always run `kubectl` and `helm` commands from the control-plane node (192.168.1.98) unless stated otherwise. IPs above are specific to this environment — update this table if the cluster is rebuilt or reused elsewhere.
+> **Single-node cluster:** This environment runs as a single-node cluster with the control plane taint removed. NGINX ingress runs in hostNetwork mode, binding directly to ports 80 and 443 on the node IP. No MetalLB or floating VIP is used.
+>
+> **Note:** Always run `kubectl` and `helm` commands from the control-plane node (192.168.1.98) unless stated otherwise. The IP above is specific to this environment — update this table if the cluster is rebuilt or reused elsewhere.
 
 ---
 
@@ -19,40 +18,29 @@ Engine URL: `https://engine.cropseyit.com/engine`
 
 > **The engine pod has very high resource requirements. Undersized nodes will cause the engine pod to stay `Pending` indefinitely and the engine will show as Unregistered in the UI.**
 
-| Environment | CPU per worker node | RAM per worker node | Hyper-V MB |
+| Environment | CPU | RAM | Hyper-V MB |
 |---|---|---|---|
 | **Lab (minimum)** | 16 vCPU | 48 GB | 49152 |
 | **Production** | 16+ vCPU | 64 GB+ | 65536+ |
 
-> **Why 48GB minimum for lab:** The engine (heavy-engine) pod alone requests 7 CPU and 40GB RAM on a single node. With OS overhead and other pods also consuming memory on the same node, 40GB is not enough — 48GB provides the headroom needed for the engine to schedule and run. For production sizing always refer to the official Akamai guide as requirements depend on traffic volume and other factors.
-
-> **Lab vs Production:** The values above are guidelines for getting a lab environment running. Production sizing depends on multiple factors including traffic volume, number of workers, and API complexity. Always refer to the official Akamai sizing guide for production deployments:
+> **Why 48GB minimum for lab:** The engine (heavy-engine) pod alone requests 7 CPU and 40GB RAM. With OS overhead and other pods consuming memory on the same node, 40GB is not enough — 48GB provides the necessary headroom.
+>
+> **Lab vs Production:** Production sizing depends on multiple factors including traffic volume, number of workers, and API complexity. Always refer to the official Akamai sizing guide:
 > - See the **Engine Sizing** section in `Akamai_Noname_K8s_Install_Guide.md` in this directory
 > - Official online reference: [Akamai API Security Engine Sizing](https://docs.nonamesecurity.com/v368/docs/multiple-engine-datasheet#engine-sizing)
 
-The `engine` (heavy-engine) pod alone requests 7 CPU and up to 40 GB RAM. The control-plane node does not schedule engine workloads — all engine pods land on worker nodes only.
-
-In this environment nodes are Hyper-V VMs. If the engine pod shows `Pending` with `Insufficient memory` or `Insufficient cpu` in `kubectl describe pod`, shut down the VMs and increase RAM and CPU in Hyper-V before proceeding. Restarting the VMs after resizing will not break the cluster — nodes rejoin automatically and private IPs are preserved.
-
-> **Note:** The AWS lab used `r5.2xlarge` instances (8 vCPU / 64 GB RAM) per node. For a basic lab 16 GB per worker is the practical minimum — anything less and the engine pod will not schedule.
-
-> **If you do not have enough resources to meet the 3-node requirements above:** You can run a single-node cluster where the control plane also runs workloads. By default Kubernetes taints the control plane node to prevent pods from scheduling on it. If resources are limited, remove the taint to allow the engine pod to run on the control plane node:
->
-> ```bash
-> kubectl taint nodes hv-rocky-linux-1 node-role.kubernetes.io/control-plane:NoSchedule-
-> ```
->
-> The `-` at the end removes the taint. After this all three nodes (including the control plane) are available for pod scheduling. Note that the engine pod still requires a single node with at least 40GB RAM — this is a workaround for resource-constrained lab environments only. When resources are available, revert to a proper 3-node cluster with the taint in place.
+In this environment the node is a Hyper-V VM. If the engine pod shows `Pending` with `Insufficient memory` or `Insufficient cpu` in `kubectl describe pod`, shut down the VM and increase RAM and CPU in Hyper-V before proceeding.
 
 ---
 
 ## Prerequisites
 
-- K8s cluster running (Rocky Linux 9.8, kubeadm) with Flannel CNI
-- MetalLB installed and VIP 192.168.1.110 assigned
-- NGINX Ingress Controller installed, EXTERNAL-IP = 192.168.1.110
-- Worker nodes meet minimum sizing requirements above
-- Outbound TCP 443 open from all nodes to:
+- Single-node k8s cluster running (Rocky Linux 9.8, kubeadm) with Flannel CNI
+- Control plane taint removed (`node-role.kubernetes.io/control-plane:NoSchedule-`)
+- NGINX Ingress Controller installed in hostNetwork mode, listening on ports 80/443 on 192.168.1.98
+- Firewall ports 80 and 443 open on the node
+- Node meets minimum sizing requirements above
+- Outbound TCP 443 open from the node to:
   - `mwc-lab.nonamesec.com`
   - `mwc-lab-mtls.nonamesec.com`
   - `pkg.nonamesec.com`
@@ -62,13 +50,13 @@ In this environment nodes are Hyper-V VMs. If the engine pod shows `Pending` wit
 
 ## Section 0 — Pre-Install Setup
 
-### Step 1 — Add /etc/hosts on all nodes and your Mac
+### Step 1 — Add /etc/hosts on the node and your Mac
 
-Since there is no DNS server, `engine.cropseyit.com` must resolve via `/etc/hosts` on every machine that needs to reach the engine. The MetalLB VIP (`192.168.1.110`) is a floating IP — it must be in `/etc/hosts` on all three nodes because engine pods can run on any node.
+Since there is no DNS server, `engine.cropseyit.com` must resolve via `/etc/hosts` on every machine that needs to reach the engine. Point it directly at the node IP.
 
 > **Important:** This entry must be added to **every machine that sends traffic to the remote engine** — including all Akamai integrations (sensors, F5 iRules, API gateways, etc.) that are configured to forward traffic to `engine.cropseyit.com`. If a traffic source cannot resolve the hostname it will fail to connect to the engine regardless of whether the engine itself is running correctly.
 
-Run on each node (192.168.1.98, .99, .100), your Mac, and any Akamai integration/sensor sending traffic to the engine:
+Run on the node (192.168.1.98), your Mac, and any Akamai integration/sensor sending traffic to the engine:
 
 ```bash
 sudo vi /etc/hosts
@@ -76,7 +64,7 @@ sudo vi /etc/hosts
 
 Add at the bottom:
 ```
-192.168.1.110   engine.cropseyit.com
+192.168.1.98   engine.cropseyit.com
 ```
 
 ---
@@ -85,7 +73,10 @@ Add at the bottom:
 
 > The rest of this doc assumes the IngressClass name is `nginx`. If your cluster returns a different name you must substitute it everywhere `ingressClassName: nginx` appears in this doc.
 
+> **Note:** Always run `kubectl` commands from the control-plane node. The IP below is specific to this environment — update it if the cluster is rebuilt or reused in a different environment.
+
 ```bash
+# 192.168.1.98 is the control-plane node in this environment
 ssh mcropsey@192.168.1.98
 kubectl get ingressclass
 ```
@@ -96,13 +87,18 @@ NAME    CONTROLLER             PARAMETERS   AGE
 nginx   k8s.io/ingress-nginx   <none>       ...
 ```
 
-> If the name is not `nginx`, note it and substitute it in Steps 6 and the reference section below.
+> **Important:** If the name is not `nginx`, note it and substitute it everywhere `ingressClassName: nginx` appears in this doc — specifically in Section 1 Step 3 and the reference section below. Using the wrong IngressClass means the NGINX controller will silently ignore the Ingress object and `engine.cropseyit.com` will never get an address.
+>
+> `ingress-nginx` and `ingress-nginx-controller` are the default names when NGINX ingress is installed using the standard bare-metal manifest. Verify with:
+> ```bash
+> kubectl get deploy -A | grep -i nginx
+> ```
 
 ---
 
 ### Step 3 — Install StorageClass (local-path-provisioner)
 
-> **Why:** Bare-metal and Hyper-V clusters have no built-in StorageClass. Without one the PVC will stay `Pending` indefinitely. Local-path-provisioner uses local disk on the nodes and sets itself as the default StorageClass automatically.
+> **Why:** Bare-metal and Hyper-V clusters have no built-in StorageClass. Without one the PVC will stay `Pending` indefinitely. Local-path-provisioner uses local disk on the node and sets itself as the default StorageClass automatically.
 >
 > **Reference:** Storage size requirements are in the Prerequisites section of `Akamai_Noname_K8s_Install_Guide.md` in this directory — **30 GB recommended, 15 GB minimum** per engine.
 
@@ -153,6 +149,8 @@ kubectl get pvc -n akamai-api-security
 > kubectl describe pvc noname-engine-pvc -n akamai-api-security
 > ```
 
+> **Important:** The local-path-provisioner stores PVC data locally on the node where the pod first runs. If you rebuild the cluster or move the engine to a different node you must delete and recreate the PVC — the data is not portable between nodes.
+
 ---
 
 ### Step 5 — Install Git and Helm on the control-plane node
@@ -163,6 +161,8 @@ kubectl get pvc -n akamai-api-security
 > - **Need to install it yourself:** kubeadm (this environment), AWS EKS, Azure AKS, Google GKE, Minikube
 >
 > **Rule of thumb:** For everything except Rancher Desktop and K3s, assume you need to install Helm.
+
+> **Note:** This is your first real action step. Everything in Section 0 was either prereq setup or reference information. The Noname engine install begins here.
 
 ```bash
 ssh mcropsey@192.168.1.98
@@ -242,7 +242,6 @@ ingress:
       pathType: Prefix
 ```
 
-
 **Change 2 — Set the PVC name.** Find `existingPVCName: null` and change it to:
 
 ```yaml
@@ -312,7 +311,7 @@ Wait until all pods show `Running`. Expected pods:
 
 | Pod | Containers |
 |---|---|
-| engine-* | 2/2 |
+| engine-* | 1/1 |
 | light-engine-* | 2/2 |
 | router-* | 1/1 |
 | nats-jetstream-* | 1/1 |
@@ -323,7 +322,6 @@ Wait until all pods show `Running`. Expected pods:
 > If pods stay `Pending` check resources and events:
 > ```bash
 > kubectl describe pod <pod-name> -n akamai-api-security
-> kubectl top nodes
 > ```
 
 ---
@@ -331,7 +329,7 @@ Wait until all pods show `Running`. Expected pods:
 ### Step 8 — Verify ingress and connectivity
 
 ```bash
-# Should show engine.cropseyit.com with ADDRESS 192.168.1.110 and CLASS nginx
+# Should show engine.cropseyit.com with ADDRESS 192.168.1.98 and CLASS nginx
 kubectl get ingress -n akamai-api-security -o wide
 
 # Confirm ingressClassName and backend service
@@ -342,11 +340,10 @@ curl -vk https://engine.cropseyit.com/engine
 # Expect: HTTP 200
 ```
 
-**Confirm the NGINX controller synced the Ingress** — run after pods are up:
-
-> `ingress-nginx` and `ingress-nginx-controller` are the default names from the standard bare-metal NGINX install used in this environment. Verify with `kubectl get deploy -A | grep -i nginx` if unsure.
+**Confirm NGINX controller synced the Ingress** — run after pods are up:
 
 ```bash
+# namespace: ingress-nginx  |  deployment: ingress-nginx-controller  (this environment)
 kubectl logs -n ingress-nginx deploy/ingress-nginx-controller | grep -i "akamai-api-security\|engine.cropseyit.com"
 
 kubectl exec -n ingress-nginx deploy/ingress-nginx-controller -- \
@@ -417,12 +414,14 @@ Authenticates callers (traffic sources/integrations) using client certificates. 
 | `CrashLoopBackOff` | `kubectl logs <pod> -n akamai-api-security --previous` | Engine can't reach `mwc-lab.nonamesec.com` |
 | Ingress has no address | `kubectl describe ingress -n akamai-api-security` | Wrong `ingressClassName` |
 | curl returns 404 | `kubectl get ingress -n akamai-api-security -o wide` | Host/path mismatch |
+| curl returns 503 | `kubectl get pods -n akamai-api-security` | NATS or router pod not ready |
 | curl returns 502/503 | `kubectl get endpoints -n akamai-api-security` | Backend pod not ready |
 | Engine shows Offline in UI | `kubectl logs deployment/engine -n akamai-api-security` | Can't reach `mwc-lab.nonamesec.com:443` |
+| Connection refused on 443 | `sudo firewall-cmd --list-ports` | Ports 80/443 not open on node firewall |
 
 ---
 
-## Outbound Ports Required from K8s Nodes
+## Outbound Ports Required from K8s Node
 
 | Destination | Port | Purpose |
 |---|---|---|
@@ -430,6 +429,3 @@ Authenticates callers (traffic sources/integrations) using client certificates. 
 | mwc-lab-mtls.nonamesec.com | TCP 443 | mTLS fallback |
 | pkg.nonamesec.com | TCP 443 | Engine updates |
 | us-central1-docker.pkg.dev | TCP 443 | Image pulls |
-
----
-
